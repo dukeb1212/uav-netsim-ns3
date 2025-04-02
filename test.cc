@@ -30,13 +30,19 @@
 #include "zmq_receiver_app.h"
 #include <sstream>
 #include <iostream>
+#include "uav/uav-telemetry.h"
+#include "uav/uav-command.h"
+#include "ns3/node-list.h"
 
 using json = nlohmann::json;
 using namespace ns3;
 
 zmq::context_t zmqContext(1);
 zmq::socket_t zmqSocket(zmqContext, ZMQ_PUB);
-std::string zmqAddress = "tcp://192.168.1.62:5555";
+std::string zmqAddress = "tcp://192.168.1.30:5555";
+
+std::map<uint32_t, Time> lastActiveTime;  // Track last active time of flows
+double inactivityThreshold = 5.0; // Threshold in seconds
 
 // Enhanced event tracking structures
 struct NodeState {
@@ -60,6 +66,23 @@ Time lastUpdateTime = Seconds(0);
 uint32_t maxConsecutiveErrors = 0;
 double totalSnr = 0;
 uint32_t snrCount = 0;
+
+std::string Ipv4ToString(const Ipv4Address &address) {
+    uint32_t ip = address.Get();
+
+    uint8_t byte1 = (ip >> 24) & 0xFF;
+    uint8_t byte2 = (ip >> 16) & 0xFF;
+    uint8_t byte3 = (ip >> 8) & 0xFF;
+    uint8_t byte4 = ip & 0xFF;
+
+    std::ostringstream oss;
+    oss << static_cast<int>(byte1) << "."
+        << static_cast<int>(byte2) << "."
+        << static_cast<int>(byte3) << "."
+        << static_cast<int>(byte4);
+
+    return oss.str();
+}
 
 void PublishZMQMessage(zmq::socket_t* socket, const std::string& topic, const json& message) {
     // // Send topic as first frame
@@ -86,18 +109,47 @@ void ReportRealTimeMetrics(Ptr<FlowMonitor> monitor, Ptr<Ipv4FlowClassifier> cla
     json flowStats;
     for (auto const& flow : stats) {
         Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow(flow.first);
-        std::string flowDirection = "1";
-        flowStats[flowDirection] = {
-            {"txBytes", flow.second.txBytes},
-            {"rxBytes", flow.second.rxBytes},
-            {"txPackets", flow.second.txPackets},
-            {"rxPackets", flow.second.rxPackets},
-            {"meanDelay", flow.second.delaySum.GetMicroSeconds() / flow.second.rxPackets},
-            {"meanJitter", flow.second.jitterSum.GetMicroSeconds() / (flow.second.rxPackets - 1)},
-            {"packetLossL3", flow.second.lostPackets}
-        };
-        
-        g_outputFile << "FLOW_STATS, "
+        std::string flowDirection = std::to_string(flow.first);
+        if (flow.second.rxPackets <= 1) {
+            flowStats[flowDirection] = {
+                {"src", Ipv4ToString(t.sourceAddress)},
+                {"dst", Ipv4ToString(t.destinationAddress)},
+                {"txBytes", flow.second.txBytes},
+                {"rxBytes", flow.second.rxBytes},
+                {"txPackets", flow.second.txPackets},
+                {"rxPackets", flow.second.rxPackets},
+                {"meanDelay", flow.second.delaySum.GetMicroSeconds() / 1},
+                {"meanJitter", flow.second.jitterSum.GetMicroSeconds() / 1},
+                {"packetLossL3", flow.second.lostPackets}
+            };
+
+            g_outputFile << "FLOW_STATS, "
+                     << "id=" << flow.first << ", "
+                     << "time=" << now << ", "
+                     << "src=" << t.sourceAddress << ":" << t.sourcePort << ", "
+                     << "dst=" << t.destinationAddress << ":" << t.destinationPort << "," 
+                     << "txBytes=" << flow.second.txBytes << ", "
+                     << "rxBytes=" << flow.second.rxBytes << ", "
+                     << "txPackets=" << flow.second.txPackets << ", "
+                     << "rxPackets=" << flow.second.rxPackets << ", "
+                     << "meanDelay=" << flow.second.delaySum.GetMicroSeconds() / 1 << "us, "
+                     << "meanJitter=" << flow.second.jitterSum.GetMicroSeconds() / 1 << "us, "
+                     << "packetLoss=" << flow.second.lostPackets << ", ";
+        } else {
+            flowStats[flowDirection] = {
+                {"src", Ipv4ToString(t.sourceAddress)},
+                {"dst", Ipv4ToString(t.destinationAddress)},
+                {"txBytes", flow.second.txBytes},
+                {"rxBytes", flow.second.rxBytes},
+                {"txPackets", flow.second.txPackets},
+                {"rxPackets", flow.second.rxPackets},
+                {"meanDelay", flow.second.delaySum.GetMicroSeconds() / flow.second.rxPackets},
+                {"meanJitter", flow.second.jitterSum.GetMicroSeconds() / (flow.second.rxPackets - 1)},
+                {"packetLossL3", flow.second.lostPackets}
+            };
+
+            g_outputFile << "FLOW_STATS, "
+                     << "id=" << flow.first << ", "
                      << "time=" << now << ", "
                      << "src=" << t.sourceAddress << ":" << t.sourcePort << ", "
                      << "dst=" << t.destinationAddress << ":" << t.destinationPort << "," 
@@ -108,6 +160,7 @@ void ReportRealTimeMetrics(Ptr<FlowMonitor> monitor, Ptr<Ipv4FlowClassifier> cla
                      << "meanDelay=" << flow.second.delaySum.GetMicroSeconds() / flow.second.rxPackets << "us, "
                      << "meanJitter=" << flow.second.jitterSum.GetMicroSeconds() / (flow.second.rxPackets - 1) << "us, "
                      << "packetLoss=" << flow.second.lostPackets << ", ";
+        }
     }
     
     metrics["conditions"]["flows"] = flowStats;
@@ -280,10 +333,13 @@ int main(int argc, char *argv[]) {
     GlobalValue::Bind("SimulatorImplementationType", StringValue("ns3::RealtimeSimulatorImpl"));
 
     LogComponentEnable("ZmqReceiverApp", LOG_LEVEL_INFO);
+    // LogComponentEnable("UavTelemetry", LOG_LEVEL_INFO);
+    // LogComponentEnable ("VideoStreamClientApplication", LOG_LEVEL_INFO);
+    // LogComponentEnable ("VideoStreamServerApplication", LOG_LEVEL_INFO);
 
     // Create network nodes
     NodeContainer nodes;
-    nodes.Create(2); // Node 1: Mobile STA, Node 0: AP
+    nodes.Create(2); // Node 1,2: Mobile STA, Node 0: AP
 
     // Configure wireless channel
     YansWifiChannelHelper channel;
@@ -326,9 +382,9 @@ int main(int argc, char *argv[]) {
     
     Ptr<ZmqReceiverApp> app = CreateObject<ZmqReceiverApp>();
     nodes.Get(0)->AddApplication(app);
-    app->SetAttribute("Address", StringValue("192.168.1.61"));
+    app->SetAttribute("Address", StringValue("192.168.1.12"));
     app->SetAttribute("Port", UintegerValue(5555));
-    app->SetAttribute("ID", StringValue("ns3"));
+    app->SetAttribute("ID", StringValue("network_events"));
     app->SetStartTime(Seconds(1));
     app->SetStopTime(Seconds(300.0));
 
@@ -337,9 +393,9 @@ int main(int argc, char *argv[]) {
 
     // Assign IP addresses
     Ipv4AddressHelper ipv4;
-    ipv4.SetBase("10.1.1.0", "255.255.255.0");
-    Ipv4InterfaceContainer interfaces = ipv4.Assign(staDevice);
-    ipv4.Assign(apDevice);
+    ipv4.SetBase("10.0.0.0", "255.255.255.0");
+    Ipv4InterfaceContainer gcsInterface = ipv4.Assign(apDevice);
+    Ipv4InterfaceContainer uavInterfaces = ipv4.Assign(staDevice);
 
     // ==================== Flow Monitor Setup ====================
     FlowMonitorHelper flowmonHelper;
@@ -347,44 +403,62 @@ int main(int argc, char *argv[]) {
 
     // ==================== Application Setup ====================
     // UDP traffic configuration
-    uint16_t port = 9;
-    Address sinkAddress(InetSocketAddress(interfaces.GetAddress(0), port));
-    PacketSinkHelper packetSinkHelper("ns3::UdpSocketFactory", sinkAddress);
+    uint16_t gcsPort = 9;
+    Address gcsSinkAddress(InetSocketAddress(gcsInterface.GetAddress(0), gcsPort));
+    PacketSinkHelper gcsPacketSinkHelper("ns3::UdpSocketFactory", gcsSinkAddress);
+
+    uint16_t uavPort = 99;
+    Address uavSinkAddress(InetSocketAddress(uavInterfaces.GetAddress(0), uavPort));
+    PacketSinkHelper uavPacketSinkHelper("ns3::UdpSocketFactory", uavSinkAddress);
     
-    // Install sink on STA
-    ApplicationContainer sinkApp = packetSinkHelper.Install(nodes.Get(0));
-    sinkApp.Start(Seconds(0.0));
-    sinkApp.Stop(Seconds(300.0));
+    // Install sink on AP
+    ApplicationContainer gcsSinkApp = gcsPacketSinkHelper.Install(nodes.Get(0));
+    gcsSinkApp.Start(Seconds(0.0));
+    gcsSinkApp.Stop(Seconds(300.0));
 
-    Ptr<OnOffApplication> onoffApp = CreateObject<OnOffApplication>();
-    nodes.Get(1)->AddApplication(onoffApp);
+    ApplicationContainer uavSinkApp = uavPacketSinkHelper.Install(nodes.Get(1));
+    uavSinkApp.Start(Seconds(0.0));
+    uavSinkApp.Stop(Seconds(300.0));
 
-    // Set the remote address (where to send packets)
-    onoffApp->SetAttribute("Remote", AddressValue(sinkAddress));
-    onoffApp->SetAttribute("DataRate", DataRateValue(DataRate("500kbps")));
-    onoffApp->SetAttribute("PacketSize", UintegerValue(512));
+    TypeId tid = TypeId::LookupByName("ns3::UdpSocketFactory");
+    Ptr<Socket> gcsSocket = Socket::CreateSocket(nodes.Get(0), tid);
+    InetSocketAddress remote = InetSocketAddress(uavInterfaces.GetAddress(0), uavPort);
+    gcsSocket->Connect(remote);
 
-    // Set start and stop times
-    onoffApp->SetStartTime(Seconds(1.0));
-    onoffApp->SetStopTime(Seconds(299.0));
+    Ptr<UavCommand> commandApp = CreateObject<UavCommand>();
+    commandApp->SetSocket(gcsSocket);
+    nodes.Get(0)->AddApplication(commandApp);
+
+    commandApp->SetStartTime(Seconds(0.5));
+    commandApp->SetStopTime(Seconds(300.0));
+
+
+    // Ptr<OnOffApplication> onoffApp = CreateObject<OnOffApplication>();
+    // nodes.Get(1)->AddApplication(onoffApp);
+
+    // // Set the remote address (where to send packets)
+    // onoffApp->SetAttribute("Remote", AddressValue(sinkAddress));
+    // onoffApp->SetAttribute("DataRate", DataRateValue(DataRate("500kbps")));
+    // onoffApp->SetAttribute("PacketSize", UintegerValue(512));
+
+    // // Set start and stop times
+    // onoffApp->SetStartTime(Seconds(1.0));
+    // onoffApp->SetStopTime(Seconds(299.0));
     
     // Periodic channel utilization logging
-    Simulator::Schedule(Seconds(1.0), &LogChannelUtilization);
+    //Simulator::Schedule(Seconds(1.0), &LogChannelUtilization);
 
-    // [Original setup code remains similar, but ensure these traces are connected:]
-    Config::Connect("/NodeList/*/DeviceList/*/Phy/State/State", MakeCallback(&PhyStateTrace));
-    Config::Connect("/NodeList/*/DeviceList/*/Phy/State/Tx", MakeCallback(&PhyTxTrace));
-    Config::Connect("/NodeList/*/DeviceList/*/Phy/State/RxOk", MakeCallback(&PhyRxOkTrace));
-    Config::Connect("/NodeList/*/DeviceList/*/Phy/State/RxError", MakeCallback(&PhyRxErrorTrace));
-    Config::Connect("/NodeList/*/$ns3::MobilityModel/CourseChange", MakeCallback(&CourseChangeCallback));
+    // ==================== Event Tracing ====================
+    // Config::Connect("/NodeList/*/DeviceList/*/Phy/State/State", MakeCallback(&PhyStateTrace));
+    // Config::Connect("/NodeList/*/DeviceList/*/Phy/State/Tx", MakeCallback(&PhyTxTrace));
+    // Config::Connect("/NodeList/*/DeviceList/*/Phy/State/RxOk", MakeCallback(&PhyRxOkTrace));
+    // Config::Connect("/NodeList/*/DeviceList/*/Phy/State/RxError", MakeCallback(&PhyRxErrorTrace));
+    // Config::Connect("/NodeList/*/$ns3::MobilityModel/CourseChange", MakeCallback(&CourseChangeCallback));
 
     flowMonitor->CheckForLostPackets();
     Ptr<Ipv4FlowClassifier> classifier = DynamicCast<Ipv4FlowClassifier>(flowmonHelper.GetClassifier());
 
     Simulator::Schedule(Seconds(1.0), &ReportRealTimeMetrics, flowMonitor, classifier, 1.0);
-
-    // [Rest of your original setup code]
-    // ...
     
     Simulator::Stop(Seconds(300.01));
     Simulator::Run();

@@ -1,10 +1,18 @@
 #include "zmq_receiver_app.h"
+#include "ns3/core-module.h"
 #include "ns3/string.h"   
 #include "ns3/uinteger.h"  
+#include "ns3/network-module.h"
+#include "ns3/internet-module.h"
 #include "ns3/pointer.h"
 #include "ns3/node-list.h"
 #include <time.h>
 #include <nlohmann/json.hpp>
+#include <iostream>
+#include "uav/uav-telemetry.h"
+#include "uav/uav-command.h"
+#include "ns3/applications-module.h"
+
 using json = nlohmann::json;
 using namespace ns3;
 
@@ -89,7 +97,7 @@ void ZmqReceiverApp::Run()
                     double y = actor["y"];
                     double z = actor["z"];
 
-                    //NS_LOG_INFO("Received Position for " << id << ": (" << x << ", " << y << ", " << z << ")");
+                    NS_LOG_INFO("Received Position for " << id << ": (" << x << ", " << y << ", " << z << ")");
 
                     Vector position(x, y, z);
                     uint32_t nodeId;
@@ -117,6 +125,123 @@ void ZmqReceiverApp::Run()
                         SetNodePosition(node, position);
                     } else {
                         NS_LOG_WARN("Node not found for ID: " << nodeId);
+                    }
+                }
+            } else if (jsonData.contains("event_type"))
+            {
+                std::string command = jsonData["event_type"];
+                std::string app_type = jsonData["app_type"];
+                // AppType type = getAppTypeFromString(app_type);
+
+                Ptr<Node> gcsNode = NodeList::GetNode(0);
+                Ptr<Node> uavNode = NodeList::GetNode(1);
+                uint32_t numApplication;
+
+                if (command == "start") {
+                    // Handle application start
+                    std::string config = jsonData["config"];
+                    int local_id = jsonData["local_id"];
+                    Ipv4InterfaceAddress gcsInterfAddress = gcsNode->GetObject<Ipv4>()->GetAddress(1, 0);
+                    Ipv4Address gcsAddress = gcsInterfAddress.GetAddress();
+
+                    Ipv4InterfaceAddress uavInterfAddress = uavNode->GetObject<Ipv4>()->GetAddress(1, 0);
+                    Ipv4Address uavAddress = uavInterfAddress.GetAddress();
+
+                    if (app_type == "Telemetry") {
+                        TypeId tid = TypeId::LookupByName("ns3::UdpSocketFactory");
+                        Ptr<Socket> criticalSocket = Socket::CreateSocket(uavNode, tid);
+                        InetSocketAddress local = InetSocketAddress(Ipv4Address::GetAny(), 9);
+                        criticalSocket->Bind(local);
+                        
+                        InetSocketAddress remote = InetSocketAddress(gcsAddress, 9);
+                        criticalSocket->Connect(remote);
+
+                        Ptr<UavTelemetry> telemetryApp = CreateObject<UavTelemetry>();
+                        telemetryApp->SetInterval(Seconds(0.1));
+                        telemetryApp->SetPacketSize(150);
+                        telemetryApp->SetSocket(criticalSocket);
+
+                        numApplication = uavNode->GetNApplications();
+                        m_telemetryAppList.insert({1, numApplication});
+                        uavNode->AddApplication(telemetryApp);
+
+                        telemetryApp->SetStartTime(Seconds(0.0));
+                        telemetryApp->SetStopTime(Time::Max());
+
+                        NS_LOG_INFO("Started Telemetry app for uav1, app index" << numApplication);
+                    } else if (app_type == "VideoStream") {
+                        VideoStreamServerHelper videoServer (5000);
+                        videoServer.SetAttribute ("MaxPacketSize", UintegerValue (1400));
+                        numApplication = uavNode->GetNApplications();
+                        m_videoServerAppList.insert({1, numApplication});
+                        ApplicationContainer serverApp = videoServer.Install (uavNode);
+                        serverApp.Start (Seconds (0.0));
+                        serverApp.Stop (Time::Max());
+
+                        NS_LOG_INFO("Started Video server app for uav1, app index" << numApplication);
+
+                        VideoStreamClientHelper videoClient(uavAddress, 5000);
+                        numApplication = gcsNode->GetNApplications();
+                        m_gcsVideoClientAppList.insert({1, numApplication});
+                        ApplicationContainer clientApp = videoClient.Install(gcsNode);
+                        clientApp.Start (Seconds(0.0));
+                        clientApp.Stop (Time::Max());
+
+                        NS_LOG_INFO("Started Video client app for gcs, app index" << numApplication);
+                    } else if (app_type == "ControlCommands") {
+                        for (uint32_t i = 0; i <= gcsNode->GetNApplications() - 1; i++) {
+                            Ptr<Application> app = gcsNode->GetApplication(i);
+                            Ptr<UavCommand> commandApp = DynamicCast<UavCommand>(app);
+                            if (commandApp) {
+                                commandApp->SendCommand(PRIO_CRITICAL);
+                                NS_LOG_INFO("Sent command with prio " << PRIO_CRITICAL);
+                            }
+                        }
+                    }
+                    NS_LOG_INFO("Received start event for " << app_type << " with config: " << config << " (Local ID: " << local_id << ")");
+                } else if (command == "stop") {
+                    NS_LOG_INFO("Received stop event for " << app_type);
+
+                    if (app_type == "Telemetry") {
+                        uint32_t appIndex;
+                        for (const auto &entry : m_telemetryAppList) {{
+                            if (entry.first == 1) {
+                                appIndex = entry.second;
+                                Ptr<Application> app = uavNode->GetApplication(appIndex);
+                                Ptr<UavTelemetry> telemetryApp = DynamicCast<UavTelemetry>(app);
+                                if (telemetryApp) {
+                                    telemetryApp->StopApplication();
+                                }
+
+                                NS_LOG_INFO("Stop telemetry app for uav 1 at app index " << appIndex);
+                            }
+                        }}
+                    } else if (app_type == "VideoStream") {
+                        uint32_t appIndex;
+                        for (const auto &entry : m_videoServerAppList) {{
+                            if (entry.first == 1) {
+                                appIndex = entry.second;
+                                Ptr<Application> app = uavNode->GetApplication(appIndex);
+                                Ptr<VideoStreamServer> videoServerApp = DynamicCast<VideoStreamServer>(app);
+                                if (videoServerApp) {
+                                    videoServerApp->StopApplication();
+                                }
+
+                                NS_LOG_INFO("Stop video server app for uav 1 at app index " << appIndex);
+                            }
+                        }}
+                        for (const auto &entry : m_gcsVideoClientAppList) {{
+                            if (entry.first == 1) {
+                                appIndex = entry.second;
+                                Ptr<Application> app = gcsNode->GetApplication(appIndex);
+                                Ptr<VideoStreamClient> videoClientApp = DynamicCast<VideoStreamClient>(app);
+                                if (videoClientApp) {
+                                    videoClientApp->StopApplication();
+                                }
+
+                                NS_LOG_INFO("Stop video client app for gcs of uav 1 at app index " << appIndex);
+                            }
+                        }}
                     }
                 }
             }
@@ -172,3 +297,19 @@ void ZmqReceiverApp::SetNodePosition(Ptr<Node> node, Vector position)
         NS_LOG_ERROR("MobilityModel is null for node: " << node->GetId());
     }
 }
+
+// AppType getAppTypeFromString(const std::string& appTypeStr) {
+//     static const std::unordered_map<std::string, AppType> appTypeMap = {
+//         {"Telemetry", Telemetry},
+//         {"VideoStream", VideoStream},
+//         {"ControlCommands", ControlCommands},
+//         {"SensorData", SensorData}
+//     };
+
+//     auto it = appTypeMap.find(appTypeStr);
+//     if (it != appTypeMap.end()) {
+//         return it->second;
+//     }
+
+//     throw std::invalid_argument("Invalid AppType string: " + appTypeStr);
+// }

@@ -11,6 +11,13 @@
 
 using namespace ns3;
 
+// enum AppType {
+//     Telemetry,
+//     VideoStream,
+//     ControlCommands,
+//     SensorData
+// }
+
 class ZmqReceiverApp : public Application
 {
 public:
@@ -33,6 +40,11 @@ private:
     zmq::socket_t m_socket;
     std::string m_id;
     zmq::message_t m_message;
+
+    std::set<std::pair<uint32_t, uint32_t>> m_telemetryAppList;
+    std::set<std::pair<uint32_t, uint32_t>> m_videoServerAppList;
+
+    std::set<std::pair<uint32_t, uint32_t>> m_gcsVideoClientAppList;
 
     std::string m_heartBeatTopic;
 };
